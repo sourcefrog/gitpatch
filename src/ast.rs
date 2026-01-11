@@ -14,11 +14,10 @@ pub struct Patch<'a> {
     pub new: File<'a>,
     /// hunks of differences; each hunk shows one area where the files differ
     pub hunks: Vec<Hunk<'a>>,
-    /// true if the last line of the file ends in a newline character
-    ///
-    /// This will only be false if at the end of the patch we encounter the text:
-    /// `\ No newline at end of file`
-    pub end_newline: bool,
+    /// If there was a `No newline at end of file` indicator after the last line of the old version of the file
+    pub old_missing_newline: bool,
+    /// If there was a `No newline at end of file` indicator after the last line of the new version of the file
+    pub new_missing_newline: bool,
 }
 
 impl fmt::Display for Patch<'_> {
@@ -28,11 +27,13 @@ impl fmt::Display for Patch<'_> {
 
         write!(f, "--- {}", self.old)?;
         write!(f, "\n+++ {}", self.new)?;
-        for hunk in &self.hunks {
-            write!(f, "\n{}", hunk)?;
-        }
-        if !self.end_newline {
-            write!(f, "\n\\ No newline at end of file")?;
+        for (i, hunk) in self.hunks.iter().enumerate() {
+            writeln!(f)?;
+            if i == self.hunks.len() - 1 {
+                hunk.fmt(f, self.old_missing_newline, self.new_missing_newline)?;
+            } else {
+                hunk.fmt(f, false, false)?;
+            }
         }
         Ok(())
     }
@@ -72,7 +73,8 @@ impl<'a> Patch<'a> {
     /// let patch = Patch::from_single(sample)?;
     /// assert_eq!(&patch.old.path, "lao");
     /// assert_eq!(&patch.new.path, "tzu");
-    /// assert_eq!(patch.end_newline, false);
+    /// assert_eq!(patch.old_missing_newline, false);
+    /// assert_eq!(patch.new_missing_newline, true);
     /// # Ok(())
     /// # }
     /// ```
@@ -234,18 +236,41 @@ impl Hunk<'_> {
             Some(h)
         }
     }
-}
 
-impl fmt::Display for Hunk<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter,
+        old_missing_newline: bool,
+        new_missing_newline: bool,
+    ) -> fmt::Result {
         write!(
             f,
             "@@ -{} +{} @@{}",
             self.old_range, self.new_range, self.range_hint
         )?;
 
-        for line in &self.lines {
+        // compute line indices to put "No newline at end of file" indicator after
+        let last_old_idx = old_missing_newline
+            .then(|| {
+                self.lines
+                    .iter()
+                    .rposition(|l| matches!(l, Line::Remove(_) | Line::Context(_)))
+            })
+            .flatten();
+        let last_new_idx = new_missing_newline
+            .then(|| {
+                self.lines
+                    .iter()
+                    .rposition(|l| matches!(l, Line::Add(_) | Line::Context(_)))
+            })
+            .flatten();
+
+        for (i, line) in self.lines.iter().enumerate() {
             write!(f, "\n{}", line)?;
+            if Some(i) == last_old_idx || Some(i) == last_new_idx {
+                writeln!(f)?;
+                write!(f, "\\ No newline at end of file")?;
+            }
         }
 
         Ok(())

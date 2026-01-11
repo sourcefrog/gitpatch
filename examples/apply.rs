@@ -14,10 +14,15 @@ fn apply(diff: Patch, old: &str) -> String {
         old_line += hunk.old_range.count;
         for line in hunk.lines {
             match line {
-                Line::Add(s) | Line::Context(s) => out.push(s),
+                Line::Add(s) | Line::Context(s) => {
+                    out.push(s);
+                }
                 Line::Remove(_) => {}
             }
         }
+    }
+    if !diff.new_missing_newline {
+        out.push("");
     }
     out.join("\n")
 }

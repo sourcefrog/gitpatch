@@ -62,9 +62,15 @@ impl Error for ParseError<'_> {
     }
 }
 
-fn consume_content_line(input: Input<'_>) -> IResult<Input<'_>, &str> {
+fn consume_content_line(input: Input<'_>) -> IResult<Input<'_>, (&str, bool)> {
     let (input, raw) = terminated(not_line_ending, line_ending)(input)?;
-    Ok((input, raw.fragment()))
+
+    let (input, missing_newline) = opt(terminated(
+        tag("\\ No newline at end of file"),
+        opt(line_ending),
+    ))(input)?;
+
+    Ok((input, (raw.fragment(), missing_newline.is_some())))
 }
 
 pub(crate) fn parse_single_patch(s: &str) -> Result<Patch<'_>, ParseError<'_>> {
@@ -100,8 +106,14 @@ fn patch(input: Input) -> IResult<Input, Patch> {
         return Ok(patch);
     }
     let (input, files) = headers(input)?;
-    let (input, hunks) = chunks(input)?;
-    let (input, no_newline_indicator) = no_newline_indicator(input)?;
+    let (
+        input,
+        ParsedHunks {
+            hunks,
+            old_missing_newline,
+            new_missing_newline,
+        },
+    ) = chunks(input)?;
     // Ignore trailing empty lines produced by some diff programs
     let (input, _) = many0(line_ending)(input)?;
 
@@ -112,7 +124,8 @@ fn patch(input: Input) -> IResult<Input, Patch> {
             old,
             new,
             hunks,
-            end_newline: !no_newline_indicator,
+            old_missing_newline,
+            new_missing_newline,
         },
     ))
 }
@@ -146,7 +159,8 @@ fn binary_files_differ(input: Input) -> IResult<Input, Patch> {
                 meta: None,
             },
             hunks: Vec::new(),
-            end_newline: false,
+            old_missing_newline: false,
+            new_missing_newline: false,
         },
     ))
 }
@@ -176,7 +190,8 @@ fn file_rename_only(input: Input<'_>) -> IResult<Input<'_>, Patch<'_>> {
                 meta: None,
             },
             hunks: Vec::new(),
-            end_newline: false,
+            old_missing_newline: false,
+            new_missing_newline: false,
         },
     ))
 }
@@ -216,9 +231,29 @@ fn header_line_content(input: Input) -> IResult<Input, File> {
     ))
 }
 
+struct ParsedHunks<'a> {
+    hunks: Vec<Hunk<'a>>,
+    old_missing_newline: bool,
+    new_missing_newline: bool,
+}
+
 // Hunks of the file differences
-fn chunks(input: Input) -> IResult<Input, Vec<Hunk>> {
-    many1(chunk)(input)
+fn chunks(input: Input) -> IResult<Input, ParsedHunks> {
+    let (span, hunks) = many1(chunk)(input)?;
+
+    let (old_missing_newline, new_missing_newline) = hunks
+        .last()
+        .map(|hunk| (hunk.old_missing_newline, hunk.new_missing_newline))
+        .unwrap_or_default();
+    let hunks = hunks.into_iter().map(|hunk| hunk.hunk).collect();
+    Ok((
+        span,
+        ParsedHunks {
+            hunks,
+            old_missing_newline,
+            new_missing_newline,
+        },
+    ))
 }
 
 fn is_next_header(input: Input<'_>) -> bool {
@@ -227,6 +262,48 @@ fn is_next_header(input: Input<'_>) -> bool {
         || input.starts_with("--- ")
         || input.starts_with("+++ ")
         || input.starts_with("@@ ")
+}
+
+#[derive(Debug, PartialEq)]
+struct ParsedHunk<'a> {
+    hunk: Hunk<'a>,
+    old_missing_newline: bool,
+    new_missing_newline: bool,
+}
+
+enum LineOrEmptyLine<'a> {
+    Line(Line<'a>, bool),
+    EmptyLine,
+}
+
+impl<'a> LineOrEmptyLine<'a> {
+    fn is_new(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyLine | Self::Line(Line::Context(_), _) | Self::Line(Line::Add(_), _)
+        )
+    }
+
+    fn is_old(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyLine | Self::Line(Line::Context(_), _) | Self::Line(Line::Remove(_), _)
+        )
+    }
+
+    fn missing_new_line(&self) -> bool {
+        match self {
+            Self::Line(_, missing_new_line) => *missing_new_line,
+            Self::EmptyLine => false,
+        }
+    }
+
+    fn into_line(self) -> Line<'a> {
+        match self {
+            Self::Line(line, _) => line,
+            Self::EmptyLine => Line::Context(""),
+        }
+    }
 }
 
 /// Looks for lines starting with + or - or space, but not +++ or ---. Not a foolproof check.
@@ -257,39 +334,67 @@ fn is_next_header(input: Input<'_>) -> bool {
 ///FIXME: Use the ranges in the chunk header to figure out how many chunk lines to parse. Will need
 /// to figure out how to count in nom more robustly than many1!(). Maybe using switch!()?
 ///FIXME: The test_parse_triple_plus_minus_hack test will no longer panic when this is fixed.
-fn chunk(input: Input) -> IResult<Input, Hunk> {
+fn chunk(input: Input) -> IResult<Input, ParsedHunk> {
     let (input, ranges) = chunk_header(input)?;
 
     // Parse chunk lines, using the range information to guide parsing
-    let (input, lines) = many0(verify(
+    let (input, mut lines) = many0(verify(
         alt((
             // Detect added lines
             map(
                 preceded(tuple((char('+'), not(tag("++ ")))), consume_content_line),
-                Line::Add,
+                |(line, missing_new_line)| LineOrEmptyLine::Line(Line::Add(line), missing_new_line),
             ),
             // Detect removed lines
             map(
                 preceded(tuple((char('-'), not(tag("-- ")))), consume_content_line),
-                Line::Remove,
+                |(line, missing_new_line)| {
+                    LineOrEmptyLine::Line(Line::Remove(line), missing_new_line)
+                },
             ),
             // Detect context lines
-            map(preceded(char(' '), consume_content_line), Line::Context),
+            map(
+                preceded(char(' '), consume_content_line),
+                |(line, missing_new_line)| {
+                    LineOrEmptyLine::Line(Line::Context(line), missing_new_line)
+                },
+            ),
             // Handle empty lines within the chunk
-            map(tag("\n"), |_| Line::Context("")),
+            map(tag("\n"), |_| LineOrEmptyLine::EmptyLine),
         )),
         // Stop parsing when we detect the next header or have parsed the expected number of lines
         |_| !is_next_header(input),
     ))(input)?;
 
+    // remove trailing empty lines
+    while matches!(lines.last(), Some(LineOrEmptyLine::EmptyLine)) {
+        lines.pop();
+    }
+
+    // was there "missing new line" indicator for any of the lines?
+    let old_missing_newline = lines
+        .iter()
+        .filter(|line| line.is_old())
+        .any(|line| line.missing_new_line());
+    let new_missing_newline = lines
+        .iter()
+        .filter(|line| line.is_new())
+        .any(|line| line.missing_new_line());
+
+    let lines = lines.into_iter().map(LineOrEmptyLine::into_line).collect();
+
     let (old_range, new_range, range_hint) = ranges;
     Ok((
         input,
-        Hunk {
-            old_range,
-            new_range,
-            range_hint,
-            lines,
+        ParsedHunk {
+            hunk: Hunk {
+                old_range,
+                new_range,
+                range_hint,
+                lines,
+            },
+            old_missing_newline,
+            new_missing_newline,
         },
     ))
 }
@@ -318,17 +423,6 @@ fn u64_digit(input: Input<'_>) -> IResult<Input<'_>, u64> {
     let (input, digits) = digit1(input)?;
     let num = digits.fragment().parse::<u64>().unwrap();
     Ok((input, num))
-}
-
-// Trailing newline indicator
-fn no_newline_indicator(input: Input<'_>) -> IResult<Input<'_>, bool> {
-    map(
-        opt(terminated(
-            tag("\\ No newline at end of file"),
-            opt(line_ending),
-        )),
-        |matched| matched.is_some(),
-    )(input)
 }
 
 fn filename(input: Input) -> IResult<Input, Cow<str>> {
@@ -578,21 +672,25 @@ mod tests {
  Therefore let there always be non-being,
    so we may see their subtlety,
  And let there always be being,\n";
-        let expected = Hunk {
-            old_range: Range { start: 1, count: 7 },
-            new_range: Range { start: 1, count: 6 },
-            range_hint: "",
-            lines: vec![
-                Line::Remove("The Way that can be told of is not the eternal Way;"),
-                Line::Remove("The name that can be named is not the eternal name."),
-                Line::Context("The Nameless is the origin of Heaven and Earth;"),
-                Line::Remove("The Named is the mother of all things."),
-                Line::Add("The named is the mother of all things."),
-                Line::Add(""),
-                Line::Context("Therefore let there always be non-being,"),
-                Line::Context("  so we may see their subtlety,"),
-                Line::Context("And let there always be being,"),
-            ],
+        let expected = ParsedHunk {
+            hunk: Hunk {
+                old_range: Range { start: 1, count: 7 },
+                new_range: Range { start: 1, count: 6 },
+                range_hint: "",
+                lines: vec![
+                    Line::Remove("The Way that can be told of is not the eternal Way;"),
+                    Line::Remove("The name that can be named is not the eternal name."),
+                    Line::Context("The Nameless is the origin of Heaven and Earth;"),
+                    Line::Remove("The Named is the mother of all things."),
+                    Line::Add("The named is the mother of all things."),
+                    Line::Add(""),
+                    Line::Context("Therefore let there always be non-being,"),
+                    Line::Context("  so we may see their subtlety,"),
+                    Line::Context("And let there always be being,"),
+                ],
+            },
+            old_missing_newline: false,
+            new_missing_newline: false,
         };
         test_parser!(chunk(sample) -> expected);
         Ok(())
@@ -666,7 +764,8 @@ mod tests {
                     ],
                 },
             ],
-            end_newline: true,
+            old_missing_newline: false,
+            new_missing_newline: false,
         };
 
         test_parser!(patch(sample) -> expected);
