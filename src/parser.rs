@@ -102,10 +102,10 @@ fn multiple_patches(input: Input) -> IResult<Input, Vec<Patch>> {
 }
 
 fn patch(input: Input) -> IResult<Input, Patch> {
+    let (input, _diff_command) = diff_command(input)?;
     if let Ok(patch) = file_rename_only(input) {
         return Ok(patch);
     }
-    let (input, _diff_command) = diff_command(input)?;
     let (input, _git_index) = git_index_line(input)?;
     if let Ok(patch) = binary_files_differ(input) {
         return Ok(patch);
@@ -172,14 +172,13 @@ fn binary_files_differ(input: Input) -> IResult<Input, Patch> {
     ))
 }
 
-/// Parse patches with "similarity index 100%", i.e., patches where a file is renamed without any
-/// other change in its diff.
+/// Attempt to match patches with "similarity index 100%", i.e., patches where a file is renamed
+/// without any other change in its diff.
 ///
-/// The `parse` function should handle rename diffs with similary index less than 100%, at least as per the test
+/// The `parse` function should handle rename diffs with similarity index less than 100%, at least as per the test
 /// `parses_file_renames_with_some_diff`.
 fn file_rename_only(input: Input<'_>) -> IResult<Input<'_>, Patch<'_>> {
-    let (rest, _parsed) = take_until("\nsimilarity index 100%\n")(input)?;
-    let (rest, _parsed) = tag("\nsimilarity index 100%\n")(rest)?;
+    let (rest, _parsed) = tag("similarity index 100%\n")(input)?;
 
     let (rest, old_name) = delimited(tag("rename from "), take_until("\n"), line_ending)(rest)?;
 
@@ -813,6 +812,33 @@ mod tests {
 
         assert_eq!(format!("{}\n", expected), sample);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_git_file_rename_without_changes() -> ParseResult<'static, ()> {
+        let sample = "\
+diff --git a/tests/test-utils/Cargo.toml b/test-utils/Cargo.toml
+similarity index 100%
+rename from tests/test-utils/Cargo.toml
+rename to test-utils/Cargo.toml
+";
+        let expected = Patch {
+            old: File {
+                path: "tests/test-utils/Cargo.toml".into(),
+                meta: None,
+            },
+            new: File {
+                path: "test-utils/Cargo.toml".into(),
+                meta: None,
+            },
+            hunks: Vec::new(),
+            old_missing_newline: false,
+            new_missing_newline: false,
+            binary: false,
+        };
+        test_parser!(patch(sample) -> expected);
+        assert_eq!(format!("{expected}\n"), sample);
         Ok(())
     }
 }

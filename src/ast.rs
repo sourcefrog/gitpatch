@@ -30,12 +30,21 @@ impl fmt::Display for Patch<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Display implementations typically hold up the invariant that there is no trailing
         // newline. This isn't enforced, but it allows them to work well with `println!`
+        let Patch { old, new, .. } = &self;
         if self.binary {
-            assert!(self.hunks.is_empty());
-            write!(f, "Binary files {} and {} differ", self.old, self.new)?;
+            assert!(
+                self.hunks.is_empty(),
+                "binary diff is not expected to have hunks"
+            );
+            write!(f, "Binary files {old} and {new} differ")?;
+        } else if self.hunks.is_empty() && old != new {
+            writeln!(f, "diff --git a/{old} b/{new}")?; // TODO: Perhaps should be emitted in every case?
+            writeln!(f, "similarity index 100%")?;
+            writeln!(f, "rename from {old}")?;
+            write!(f, "rename to {new}")?;
         } else {
-            writeln!(f, "--- {}", self.old)?;
-            write!(f, "+++ {}", self.new)?;
+            writeln!(f, "--- {old}")?;
+            write!(f, "+++ {new}")?;
             for (i, hunk) in self.hunks.iter().enumerate() {
                 writeln!(f)?;
                 if i == self.hunks.len() - 1 {
